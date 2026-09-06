@@ -9,18 +9,17 @@ Projektstruktur seit 0.51.19:
 - `build.zig.zon` bindet `r4os_sdk` als Paket.
 - `module.R4MF` beschreibt Artefakt, Zielpfad, Imports und Contract.
 
-Build:
+Build unter Windows und Linux:
 
-    cd Code\System\Software\TcpEcho
-    ..\..\..\DevTools\Zig\zig.exe build
+    Build.bat
+    ./Build.sh
 
 Ergebnis:
 
-    Code\System\Software\TcpEcho\zig-out\TCPECHO.R4X
+    Artifacts/Modules/TcpEcho/TCPECHO.R4X
 
 Contract:
-- R4XStart-Entry: `tcpecho_main`
+- R4XStart-Entry: `r4_app_main`
 - App-Klasse: `console`
-- R4L-Imports: `R4SYS`, `R4NET`
+- Platform-API-Imports: `R4SYS`, `R4NET`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\TCPECHO.R4X`
-
