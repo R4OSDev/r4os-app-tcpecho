@@ -78,8 +78,9 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     ctx.printU64(options.port);
     ctx.write(": ");
 
+    const deadline = ctx.sys.ticks() +| ctx.sys.ticksFromMilliseconds(10_000);
     const remote = r4os.SocketAddress{ .address = r4os.Ipv4Address.fromBytes(options.target_ip), .port = options.port };
-    var socket = switch (ctx.net.connectTcp(remote, networkTimeout())) {
+    var socket = switch (ctx.net.connectTcp(remote, remainingTimeout(&ctx, deadline) orelse return 1)) {
         .socket => |value| value,
         .would_block => {
             ctx.write("would block\r\n");
@@ -108,46 +109,19 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     };
     ctx.write("ok\r\n");
 
-    const written = switch (socket.write(options.payload, networkTimeout())) {
-        .bytes => |value| value,
-        else => 0,
-    };
-    if (written != options.payload.len) {
-        ctx.write("TCPECHO write: failed\r\n");
-        _ = socket.close(networkTimeout());
+    defer closeSocket(&ctx, &socket);
+    if (!writeAll(&ctx, &socket, options.payload, deadline)) {
+        ctx.write("TCPECHO write: incomplete or timed out\r\n");
         return 1;
     }
     ctx.write("TCPECHO sent: ");
-    ctx.printU64(@intCast(written));
+    ctx.printU64(options.payload.len);
     ctx.write("\r\n");
 
     var reply: [MAX_TCP_PAYLOAD]u8 = undefined;
-    const got = switch (socket.read(reply[0..], networkTimeout())) {
-        .bytes => |value| value,
-        .would_block => {
-            ctx.write("TCPECHO read: would block\r\n");
-            return 1;
-        },
-        .timed_out => {
-            ctx.write("TCPECHO read: timeout\r\n");
-            return 1;
-        },
-        .reset => {
-            ctx.write("TCPECHO read: reset\r\n");
-            return 1;
-        },
-        .peer_closed => {
-            ctx.write("TCPECHO read: peer closed\r\n");
-            return 1;
-        },
-        else => {
-            ctx.write("TCPECHO read: failed\r\n");
-            return 1;
-        },
-    };
-    _ = socket.close(networkTimeout());
-    if (got == 0) {
-        ctx.write("TCPECHO read: closed\r\n");
+    const got = options.payload.len;
+    if (!readExact(&ctx, &socket, reply[0..got], deadline)) {
+        ctx.write("TCPECHO read: incomplete or timed out\r\n");
         return 1;
     }
     const reply_bytes = reply[0..got];
@@ -208,13 +182,11 @@ fn listenOnce(ctx: *const App, port: u16) i32 {
     ctx.write(": ");
     if (got != 0) {
         const bytes = payload[0..got];
-        const written = switch (socket.write(bytes, networkTimeout())) {
-            .bytes => |value| value,
-            else => 0,
-        };
-        _ = socket.close(networkTimeout());
+        const deadline = ctx.sys.ticks() +| ctx.sys.ticksFromMilliseconds(10_000);
+        const complete = writeAll(ctx, &socket, bytes, deadline);
+        closeSocket(ctx, &socket);
         _ = listener.close(networkTimeout());
-        if (written != got) {
+        if (!complete) {
             ctx.write("failed\r\n");
             return 1;
         }
@@ -310,6 +282,51 @@ fn gatewayIp(ctx: *const App) ?[4]u8 {
         return null;
     }
     return snapshot.gateway_ip;
+}
+
+fn remainingTimeout(ctx: *const App, deadline: u64) ?r4os.time_contract.Timeout {
+    const now = ctx.sys.ticks();
+    if (now >= deadline) return null;
+    const duration = r4os.time_contract.durationFromTicks(deadline - now, ctx.sys.monotonicHz()) catch return null;
+    return r4os.time_contract.timeoutFinite(duration);
+}
+
+fn writeAll(ctx: *const App, socket: *r4os.app_network.TcpSocket, bytes: []const u8, deadline: u64) bool {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const timeout = remainingTimeout(ctx, deadline) orelse return false;
+        switch (socket.write(bytes[sent..], timeout)) {
+            .bytes => |count| {
+                if (count == 0 or count > bytes.len - sent) return false;
+                sent += count;
+            },
+            .would_block => ctx.sys.sleepTicks(1),
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn readExact(ctx: *const App, socket: *r4os.app_network.TcpSocket, bytes: []u8, deadline: u64) bool {
+    var received: usize = 0;
+    while (received < bytes.len) {
+        const timeout = remainingTimeout(ctx, deadline) orelse return false;
+        switch (socket.read(bytes[received..], timeout)) {
+            .bytes => |count| {
+                if (count == 0 or count > bytes.len - received) return false;
+                received += count;
+            },
+            .would_block => ctx.sys.sleepTicks(1),
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn closeSocket(ctx: *const App, socket: *r4os.app_network.TcpSocket) void {
+    if (!socket.valid()) return;
+    const result = socket.close(r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(250_000_000)));
+    if (result != .closed) ctx.write("TCPECHO close: not confirmed\r\n");
 }
 
 fn networkTimeout() r4os.time_contract.Timeout {

@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.1`
+- Version: `0.1.2`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/TCPECHO.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -38,3 +38,11 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+
+The client accumulates positive partial writes and reads until the complete
+expected echo is received. Connect, writes and reads share one ten-second
+deadline. A zero-progress or terminal result fails; would-block retries stay
+inside that deadline. The listener also completes a partially accepted write
+of its first received chunk. Socket cleanup runs on every client exit; an
+unconfirmed close is reported instead of being described as successful.
