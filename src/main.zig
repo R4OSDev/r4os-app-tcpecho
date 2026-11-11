@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const MAX_TCP_PAYLOAD: usize = r4os.abi.net_service_tcp_read_max;
@@ -6,7 +7,7 @@ const DEFAULT_PAYLOAD = "R4TCPECHO";
 
 const Options = struct {
     target_text: []const u8,
-    target_ip: [4]u8,
+    target: r4os.abi.NetworkEndpoint,
     port: u16,
     payload: []const u8,
     resolved: bool,
@@ -14,44 +15,58 @@ const Options = struct {
 };
 
 const App = struct {
+    app: *r4os.App2,
     sys: r4os.r4sys.Context,
-    net: r4os.Network,
-    net_low: r4os.r4net.Context,
-
-    fn init(app: *r4os.App) ?App {
-        return .{
-            .sys = app.system(),
-            .net = app.network() orelse return null,
-            .net_low = app.networkLowLevel() orelse return null,
-        };
-    }
+    output: *r4os.launch_io.Output,
+    network: *r4os.network_stream.Session,
+    budget: *r4os.rpc_budget.Budget,
+    args: []const u8,
+    family: u32,
 
     fn write(self: *const App, value: []const u8) void {
-        self.sys.write(value);
+        self.output.write(value);
     }
-
-    fn putc(self: *const App, ch: u8) void {
-        self.sys.putc(ch);
-    }
-
     fn printU64(self: *const App, value: u64) void {
-        self.sys.printU64(value);
-    }
-
-    fn netConfigGet(self: *const App, out: *r4os.abi.NetConfigSnapshot) i32 {
-        return self.net_low.netConfigGet(out);
+        self.output.number(value);
     }
 };
 
-pub fn r4_app_main(app: *r4os.App) i32 {
-    const ctx = App.init(app) orelse return r4os.abi.err_no_group;
-    const args = trim(app.args());
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    var output: r4os.launch_io.Output = undefined;
+    if (r4os.launch_io.Output.init(app, &output) != 0) return 1;
+    var selected_family: u32 = 0;
+    const args = r4os.network_stream.arguments(app.args(), &selected_family) orelse {
+        output.write("TCPECHO: invalid argument grammar\r\n");
+        _ = output.close();
+        return 1;
+    };
+    var budget = r4os.rpc_budget.Budget.fromTimeout(output.clock.read, .{ .kind = 1, .nanoseconds = 10_000_000_000 }) catch {
+        _ = output.close();
+        return 1;
+    };
+    var network: r4os.network_stream.Session = undefined;
+    const opened = r4os.network_stream.Session.open(app, &budget, &network);
+    if (opened != 0) {
+        output.write("TCPECHO: TCPSVC unavailable or invalid\r\n");
+        _ = output.close();
+        return 1;
+    }
+    const ctx: App = .{ .app = app, .sys = app.system(), .output = &output, .network = &network, .budget = &budget, .args = args, .family = selected_family };
+    const result = run(&ctx);
+    const closed = network.close();
+    if (closed != 0) output.write("TCPECHO close: not confirmed\r\n");
+    const io_closed = output.close();
+    return if (output.failed or closed != 0 or io_closed != 0) 1 else result;
+}
+
+fn run(ctx: *const App) i32 {
+    const args = trim(ctx.args);
     if (parseListenPort(args)) |port| {
-        return listenOnce(&ctx, port);
+        return listenOnce(ctx, port);
     }
 
-    const options = parseOptions(&ctx, args) orelse {
-        usage(&ctx);
+    const options = parseOptions(ctx, args) orelse {
+        usage(ctx);
         return 1;
     };
 
@@ -62,56 +77,34 @@ pub fn r4_app_main(app: *r4os.App) i32 {
 
     if (options.used_gateway_default) {
         ctx.write("TCPECHO target: default gateway ");
-        writeIpv4(&ctx, options.target_ip);
+        writeAddress(ctx, options.target.address);
         ctx.write("\r\n");
     } else if (options.resolved) {
         ctx.write("TCPECHO resolved ");
         ctx.write(options.target_text);
         ctx.write(" to ");
-        writeIpv4(&ctx, options.target_ip);
+        writeAddress(ctx, options.target.address);
         ctx.write("\r\n");
     }
 
     ctx.write("TCPECHO connect ");
-    writeIpv4(&ctx, options.target_ip);
+    writeAddress(ctx, options.target.address);
     ctx.write(":");
     ctx.printU64(options.port);
     ctx.write(": ");
 
-    const deadline = ctx.sys.ticks() +| ctx.sys.ticksFromMilliseconds(10_000);
-    const remote = r4os.SocketAddress{ .address = r4os.Ipv4Address.fromBytes(options.target_ip), .port = options.port };
-    var socket = switch (ctx.net.connectTcp(remote, remainingTimeout(&ctx, deadline) orelse return 1)) {
-        .socket => |value| value,
-        .would_block => {
-            ctx.write("would block\r\n");
-            return 1;
-        },
-        .timed_out => {
-            ctx.write("timeout\r\n");
-            return 1;
-        },
-        .reset => {
-            ctx.write("reset\r\n");
-            return 1;
-        },
-        .peer_closed => {
-            ctx.write("peer closed\r\n");
-            return 1;
-        },
-        .no_service => {
-            ctx.write("TCPSVC unavailable\r\n");
-            return 1;
-        },
-        .failure => {
-            ctx.write("failed\r\n");
-            return 1;
-        },
-    };
+    var socket: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(options.target, false, ctx.budget, &socket) != 0) {
+        ctx.write("failed\r\n");
+        return 1;
+    }
     ctx.write("ok\r\n");
-
-    defer closeSocket(&ctx, &socket);
-    if (!writeAll(&ctx, &socket, options.payload, deadline)) {
-        ctx.write("TCPECHO write: incomplete or timed out\r\n");
+    defer socket.close();
+    const sent = socket.writeAll(options.payload, ctx.budget) catch return 1;
+    if (!r4os.network_stream.complete(sent)) {
+        ctx.write("TCPECHO write: incomplete prefix=");
+        ctx.printU64(sent.bytes);
+        ctx.write("\r\n");
         return 1;
     }
     ctx.write("TCPECHO sent: ");
@@ -120,7 +113,9 @@ pub fn r4_app_main(app: *r4os.App) i32 {
 
     var reply: [MAX_TCP_PAYLOAD]u8 = undefined;
     const got = options.payload.len;
-    if (!readExact(&ctx, &socket, reply[0..got], deadline)) {
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
+    const received = reader.read(reply[0..got], true, ctx.budget) catch return 1;
+    if (!r4os.network_stream.complete(received)) {
         ctx.write("TCPECHO read: incomplete or timed out\r\n");
         return 1;
     }
@@ -140,67 +135,43 @@ pub fn r4_app_main(app: *r4os.App) i32 {
 }
 
 fn listenOnce(ctx: *const App, port: u16) i32 {
-    var payload: [MAX_TCP_PAYLOAD]u8 = undefined;
     ctx.write("TCPECHO listen ");
     ctx.printU64(port);
     ctx.write(": waiting\r\n");
-
-    var listener = switch (ctx.net.listenTcp(port, networkTimeout())) {
-        .listener => |value| value,
-        .timed_out => {
-            ctx.write("TCPECHO listen: timeout\r\n");
-            return 1;
-        },
-        .no_service => {
-            ctx.write("TCPECHO listen: TCPSVC unavailable\r\n");
-            return 1;
-        },
-        .failure => {
-            ctx.write("TCPECHO listen: failed\r\n");
-            return 1;
-        },
-    };
-    var socket = switch (listener.accept(networkTimeout())) {
-        .socket => |value| value,
-        .would_block, .timed_out => {
-            _ = listener.close(networkTimeout());
-            ctx.write("timeout\r\n");
-            return 1;
-        },
-        else => {
-            _ = listener.close(networkTimeout());
-            ctx.write("failed\r\n");
-            return 1;
-        },
-    };
-    const got = switch (socket.read(payload[0..], networkTimeout())) {
-        .bytes => |value| value,
-        else => 0,
-    };
+    const endpoint: r4os.abi.NetworkEndpoint = .{ .address = .{ .family = if (ctx.family == 6) 6 else 4 }, .port = port };
+    var listener: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(endpoint, true, ctx.budget, &listener) != 0) {
+        ctx.write("TCPECHO listen: failed\r\n");
+        return 1;
+    }
+    defer listener.close();
+    var socket: r4os.network_stream.Socket = undefined;
+    if (listener.accept(ctx.budget, &socket) != 0) {
+        ctx.write("TCPECHO listen: accept failed\r\n");
+        return 1;
+    }
+    defer socket.close();
+    var payload: [MAX_TCP_PAYLOAD]u8 = undefined;
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
+    const got = reader.read(&payload, false, ctx.budget) catch return 1;
+    if (got.bytes == 0 or got.flags & r4os.stream_transfer.core.terminal != 0 and got.outcome != @intFromEnum(r4os.stream_transfer.Outcome.eof) and !r4os.network_stream.complete(got)) {
+        ctx.write("TCPECHO listen: closed or failed\r\n");
+        return 1;
+    }
+    const bytes = payload[0..@intCast(got.bytes)];
+    const sent = socket.writeAll(bytes, ctx.budget) catch return 1;
+    if (!r4os.network_stream.complete(sent)) {
+        ctx.write("TCPECHO listen: write failed\r\n");
+        return 1;
+    }
     ctx.write("TCPECHO listen ");
     ctx.printU64(port);
-    ctx.write(": ");
-    if (got != 0) {
-        const bytes = payload[0..got];
-        const deadline = ctx.sys.ticks() +| ctx.sys.ticksFromMilliseconds(10_000);
-        const complete = writeAll(ctx, &socket, bytes, deadline);
-        closeSocket(ctx, &socket);
-        _ = listener.close(networkTimeout());
-        if (!complete) {
-            ctx.write("failed\r\n");
-            return 1;
-        }
-        ctx.write("ok bytes=");
-        ctx.printU64(got);
-        ctx.write(" payload=");
-        ctx.write(bytes);
-        ctx.write("\r\n");
-        return 0;
-    }
-    _ = socket.close(networkTimeout());
-    _ = listener.close(networkTimeout());
-    ctx.write("closed\r\n");
-    return 1;
+    ctx.write(": ok bytes=");
+    ctx.printU64(got.bytes);
+    ctx.write(" payload=");
+    ctx.write(bytes);
+    ctx.write("\r\n");
+    return 0;
 }
 
 fn parseListenPort(args: []const u8) ?u16 {
@@ -217,63 +188,44 @@ fn parseListenPort(args: []const u8) ?u16 {
 fn parseOptions(ctx: *const App, args: []const u8) ?Options {
     var rest = trim(args);
     var target_text: []const u8 = "gateway";
-    var target_ip: [4]u8 = .{0} ** 4;
+    var target: r4os.abi.NetworkEndpoint = .{};
     var port: u16 = DEFAULT_PORT;
     var resolved = false;
     var used_gateway_default = false;
-
     if (takeToken(rest)) |first| {
-        if (parseIpv4(first.token)) |ip| {
-            target_text = first.token;
-            target_ip = ip;
-            rest = first.rest;
-        } else if (parsePort(first.token)) |parsed_port| {
+        if (parsePort(first.token)) |parsed_port| {
             used_gateway_default = true;
-            target_ip = gatewayIp(ctx) orelse return null;
+            target = r4os.network_family.common.v4Endpoint(gatewayIp(ctx) orelse return null, parsed_port);
             port = parsed_port;
             rest = first.rest;
         } else {
             target_text = first.token;
-            var resolver = ctx.net.resolver();
-            const result = resolver.resolveA(first.token, null, networkTimeout());
-            const resolved_address = switch (result) {
-                .address => |value| value,
-                else => {
-                    ctx.write("TCPECHO resolve failed for ");
-                    ctx.write(first.token);
-                    ctx.write("\r\n");
-                    return null;
-                },
-            };
-            target_ip = resolved_address.octets;
-            resolved = true;
             rest = first.rest;
+            if (takeToken(rest)) |second| {
+                port = parsePort(second.token) orelse return null;
+                rest = second.rest;
+            }
+            if (ctx.network.resolve(target_text, port, ctx.family, ctx.budget, &target) != 0) {
+                ctx.write("TCPECHO resolve failed for ");
+                ctx.write(target_text);
+                ctx.write("\r\n");
+                return null;
+            }
+            const numeric = if (target_text.len >= 2 and target_text[0] == '[') target_text[1 .. target_text.len - 1] else target_text;
+            resolved = r4os.network_family.parseAddress(numeric) == null;
         }
     } else {
         used_gateway_default = true;
-        target_ip = gatewayIp(ctx) orelse return null;
+        target = r4os.network_family.common.v4Endpoint(gatewayIp(ctx) orelse return null, port);
     }
-
-    if (!used_gateway_default) {
-        if (takeToken(rest)) |second| {
-            port = parsePort(second.token) orelse return null;
-            rest = second.rest;
-        }
-    }
-
-    return .{
-        .target_text = target_text,
-        .target_ip = target_ip,
-        .port = port,
-        .payload = if (rest.len == 0) DEFAULT_PAYLOAD else rest,
-        .resolved = resolved,
-        .used_gateway_default = used_gateway_default,
-    };
+    if (used_gateway_default and ctx.family == 6) return null;
+    return .{ .target_text = target_text, .target = target, .port = port, .payload = if (rest.len == 0) DEFAULT_PAYLOAD else rest, .resolved = resolved, .used_gateway_default = used_gateway_default };
 }
 
 fn gatewayIp(ctx: *const App) ?[4]u8 {
     var snapshot: r4os.abi.NetConfigSnapshot = .{};
-    if (ctx.netConfigGet(&snapshot) != r4os.abi.net_config_ok) {
+    const net = ctx.app.networkLowLevel() orelse return null;
+    if (net.netConfigGet(&snapshot) != r4os.abi.net_config_ok) {
         ctx.write("TCPECHO: no network config\r\n");
         return null;
     }
@@ -284,124 +236,29 @@ fn gatewayIp(ctx: *const App) ?[4]u8 {
     return snapshot.gateway_ip;
 }
 
-fn remainingTimeout(ctx: *const App, deadline: u64) ?r4os.time_contract.Timeout {
-    const now = ctx.sys.ticks();
-    if (now >= deadline) return null;
-    const duration = r4os.time_contract.durationFromTicks(deadline - now, ctx.sys.monotonicHz()) catch return null;
-    return r4os.time_contract.timeoutFinite(duration);
-}
-
-fn writeAll(ctx: *const App, socket: *r4os.app_network.TcpSocket, bytes: []const u8, deadline: u64) bool {
-    var sent: usize = 0;
-    while (sent < bytes.len) {
-        const timeout = remainingTimeout(ctx, deadline) orelse return false;
-        switch (socket.write(bytes[sent..], timeout)) {
-            .bytes => |count| {
-                if (count == 0 or count > bytes.len - sent) return false;
-                sent += count;
-            },
-            .would_block => ctx.sys.sleepTicks(1),
-            else => return false,
-        }
-    }
-    return true;
-}
-
-fn readExact(ctx: *const App, socket: *r4os.app_network.TcpSocket, bytes: []u8, deadline: u64) bool {
-    var received: usize = 0;
-    while (received < bytes.len) {
-        const timeout = remainingTimeout(ctx, deadline) orelse return false;
-        switch (socket.read(bytes[received..], timeout)) {
-            .bytes => |count| {
-                if (count == 0 or count > bytes.len - received) return false;
-                received += count;
-            },
-            .would_block => ctx.sys.sleepTicks(1),
-            else => return false,
-        }
-    }
-    return true;
-}
-
-fn closeSocket(ctx: *const App, socket: *r4os.app_network.TcpSocket) void {
-    if (!socket.valid()) return;
-    const result = socket.close(r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(250_000_000)));
-    if (result != .closed) ctx.write("TCPECHO close: not confirmed\r\n");
-}
-
-fn networkTimeout() r4os.time_contract.Timeout {
-    return r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(10_000_000_000));
-}
-
 fn usage(ctx: *const App) void {
-    ctx.write("Usage: TCPECHO [host] [port] [text]\r\n");
-    ctx.write("       TCPECHO /LISTEN [port]\r\n");
+    ctx.write("Usage: TCPECHO [-4|-6] [host] [port] [text]\r\n");
+    ctx.write("       TCPECHO [-4|-6] /LISTEN [port]\r\n");
 }
 
-const Token = struct {
-    token: []const u8,
-    rest: []const u8,
-};
-
+const Token = struct { token: []const u8, rest: []const u8 };
 fn takeToken(value: []const u8) ?Token {
-    const trimmed = trim(value);
-    if (trimmed.len == 0) return null;
-    var end: usize = 0;
-    while (end < trimmed.len and !isSpace(trimmed[end])) : (end += 1) {}
-    return .{
-        .token = trimmed[0..end],
-        .rest = if (end >= trimmed.len) "" else trim(trimmed[end..]),
-    };
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(value, .{}, &failure) catch return null;
+    const token = (cursor.next() catch return null) orelse return null;
+    return .{ .token = token.bytes(value) catch return null, .rest = cursor.remainingArguments() catch return null };
 }
 
 fn parsePort(value: []const u8) ?u16 {
     if (value.len == 0) return null;
-    var out: u32 = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        out = out * 10 + @as(u32, ch - '0');
-        if (out == 0 or out > 65535) return null;
-    }
-    return @intCast(out);
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(u16, value, 10) catch return null;
+    return if (number == 0) null else number;
 }
 
-fn parseIpv4(value: []const u8) ?[4]u8 {
-    var out: [4]u8 = .{0} ** 4;
-    var part: usize = 0;
-    var accum: u16 = 0;
-    var digits: usize = 0;
-
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const ch = value[index];
-        if (ch >= '0' and ch <= '9') {
-            accum = accum * 10 + @as(u16, ch - '0');
-            if (accum > 255) return null;
-            digits += 1;
-            if (digits > 3) return null;
-        } else if (ch == '.') {
-            if (digits == 0 or part >= 3) return null;
-            out[part] = @intCast(accum);
-            part += 1;
-            accum = 0;
-            digits = 0;
-        } else {
-            return null;
-        }
-    }
-    if (digits == 0 or part != 3) return null;
-    out[part] = @intCast(accum);
-    return out;
-}
-
-fn writeIpv4(ctx: *const App, ip: [4]u8) void {
-    ctx.printU64(ip[0]);
-    ctx.putc('.');
-    ctx.printU64(ip[1]);
-    ctx.putc('.');
-    ctx.printU64(ip[2]);
-    ctx.putc('.');
-    ctx.printU64(ip[3]);
+fn writeAddress(ctx: *const App, address: r4os.abi.NetworkAddress) void {
+    var buffer: [80]u8 = undefined;
+    ctx.write(r4os.network_family.addressText(&buffer, address) catch "unknown");
 }
 
 fn isZeroIp(ip: [4]u8) bool {
