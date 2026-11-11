@@ -116,7 +116,11 @@ fn run(ctx: *const App) i32 {
     var reader: r4os.network_stream.Reader = .{ .socket = &socket };
     const received = reader.read(reply[0..got], true, ctx.budget) catch return 1;
     if (!r4os.network_stream.complete(received)) {
-        ctx.write("TCPECHO read: incomplete or timed out\r\n");
+        ctx.write("TCPECHO read: ");
+        ctx.write(@tagName(@as(r4os.stream_transfer.Outcome, @enumFromInt(received.outcome))));
+        ctx.write(" prefix=");
+        ctx.printU64(received.bytes);
+        ctx.write("\r\n");
         return 1;
     }
     const reply_bytes = reply[0..got];
